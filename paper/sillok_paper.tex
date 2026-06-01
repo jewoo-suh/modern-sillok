@@ -1,0 +1,926 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{kotex}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{microtype}
+\usepackage{seqsplit}
+\usepackage[hidelinks]{hyperref}
+
+\title{\texttt{.sillok}: A Korean-Specific Lossless Text Encoding Format\\for Linguistically-Informed Compression and Long-Term Archival}
+
+\author{\IEEEauthorblockN{Jewoo Suh}%
+\IEEEauthorblockA{Independent Researcher\\jewoosuh0111\,[at]\,gmail.com}}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+UTF-8 encodes every Hangul syllable in a fixed three bytes, ignoring the strong
+frequency structure of the Korean script, while the general-purpose compressors
+that do exploit that structure produce output recoverable only with a faithful
+implementation of their algorithm. We present \texttt{.sillok}, a lossless
+encoding for Korean aimed at long-term archival, designed for both efficiency
+and recoverability. The format decomposes each Hangul syllable into its onset,
+vowel, and coda and codes each position with a static, published Huffman table
+derived from a Korean news corpus, encoding a syllable in 9.46 bits on average
+against UTF-8's 24. A word-length prefix reconstructs word boundaries without
+storing spaces, a glue marker preserves spacing within mixed-script tokens, and
+numbers, embedded Latin text, and document structure receive dedicated
+representations; a date-stamped, scannable day-boundary marker delimits records.
+Evaluated on a held-out test set of Korean news, with the frequency tables
+trained on a disjoint split, \texttt{.sillok} reduces size by 56.4\% relative to
+UTF-8. On the independent per-record basis for which it is intended, this matches
+the strongest general-purpose compressor (Brotli) and exceeds gzip, zstd, and
+lzma, while being the only one of them reconstructible from the bitstream alone,
+through Korean phonology and frequency analysis. We provide byte-identical Python
+and C implementations, the latter decoding at 52 times the speed of the former.
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+% ============================================================
+
+The Korean writing system, Hangul, possesses a unique compositional structure among the world's scripts. Each syllable block is assembled from exactly three components: an onset consonant (\emph{choseong}, 초성), a nucleus vowel (\emph{jungseong}, 중성), and an optional coda consonant (\emph{jongseong}, 종성), drawn from finite, well-defined inventories of 19, 21, and 28 elements respectively \cite{nikl, unicodehangul}. This regularity, a deliberate product of King Sejong's 15th-century design \cite{hunminjeongeum}, creates an opportunity that general-purpose text encodings and compression algorithms fail to exploit.
+
+UTF-8, the dominant encoding for Korean text on the internet, allocates a fixed 3 bytes (24 bits) per Hangul syllable \cite{rfc3629, unicodehangul}. This uniform cost ignores the vast frequency imbalances among Korean phonemes: the vowel \emph{ㅏ} accounts for nearly 20\% of all vowel occurrences in our news corpus, while \emph{ㅒ} appears in fewer than 0.02\% \cite{kref}. General-purpose compression algorithms such as gzip \cite{gzip}, zstd \cite{zstd}, and Brotli \cite{brotli} can exploit statistical redundancy, but they operate on raw byte sequences with no knowledge of Hangul's compositional structure, and they produce output that is opaque to human analysis, a critical limitation for archival applications where long-term decodability without software is desired.
+
+This paper presents \texttt{.sillok}, a lossless text encoding format designed specifically for the Korean language. Named after the \emph{Joseon Wangjo Sillok} (조선왕조실록), the daily records of the Joseon Dynasty that were maintained continuously for 472 years and are now a UNESCO Memory of the World \cite{sillok}, the format is motivated by two goals:
+
+\begin{enumerate}
+    \item \textbf{Efficient compression} through linguistically-informed encoding that decomposes Hangul syllables into jamo components and applies position-specific Huffman coding, achieving approximately 9.46 bits per syllable compared to UTF-8's 24 bits, a 60.6\% reduction at the syllable level.
+
+    \item \textbf{Archaeological recoverability} as a core design principle: a future reader encountering the raw bitstream should be able to reconstruct the original text through frequency analysis and knowledge of Korean phonology, without access to a software decoder.
+\end{enumerate}
+
+The format employs a four-state finite state machine driven by four prefix-free Huffman tables \cite{huffman}. Rather than encoding each of the 11,172 possible Hangul syllable blocks as an independent symbol, \texttt{.sillok} decomposes syllables into their constituent jamo and encodes each position (onset, vowel, coda) with a dedicated Huffman table trained on corpus-derived frequency data. This decomposition reduces the symbol space from 11,172 to a combined 68 symbols across three tables, producing shorter codes and enabling recovery through phonological analysis.
+
+A key innovation is the \emph{word-length prefix} mechanism for encoding word boundaries. Korean words (어절, spacing units) exhibit a tight syllable-length distribution, with approximately 88.9\% of words comprising 1--4 syllables in our news corpus (Section~\ref{sec:evaluation}). Rather than encoding space characters explicitly or appending per-syllable boundary flags, \texttt{.sillok} encodes each word's syllable count once at the start, allowing the decoder to count syllables and reinsert boundaries automatically. This costs about 0.85 bits per syllable for word boundaries, below both an entropy-optimal per-syllable boundary flag (0.92 bits) and an explicit space symbol (1.09 bits); a compact \texttt{GLUE} marker then preserves spacing within mixed-script tokens such as \emph{제1의} losslessly, as detailed in Section~\ref{sec:optimizations}.
+
+The format additionally provides compact representations for numbers (via binary-coded decimal), embedded non-Hangul text (via a UTF-8 escape marker terminated by a null byte), and document structure (via day-boundary markers and section separators). The day-boundary marker, 16 consecutive zero bits followed by a 21-bit date, exists outside the Huffman encoding system entirely: the long zero run is conspicuous in a raw bit dump and serves as a human-recoverable landmark for locating records, with the following date field providing confirmation. We discuss the scope and limits of this scannability, including false matches that can occur within numeric and ASCII content, in Section~\ref{sec:archaeological}.
+
+We evaluate \texttt{.sillok} on a held-out test set of 2{,}740 Korean news articles (1.86 million syllables), drawn from a corpus whose separate training split supplies the frequency tables. The format reduces size by 56.4\% relative to UTF-8. On the per-record basis for which it is designed, this is competitive with the strongest general-purpose compressors, matching Brotli and exceeding gzip, zstd, and lzma, while remaining recoverable from the bitstream alone in a way none of them are. We provide encoder and decoder implementations in Python and C, verified to produce byte-identical output, and measure decode throughput of 3.74 ms per 100,000 characters in C, a 52$\times$ speedup over the Python reference implementation.
+
+The remainder of this paper is organised as follows. Section~\ref{sec:background} reviews Hangul's phonological structure and prior work on Korean text compression. Section~\ref{sec:format} describes the \texttt{.sillok} format specification, including the state machine, Huffman tables, and structural markers. Section~\ref{sec:optimizations} details the word-length prefix mechanism, ASCII escape encoding, and number encoding, with information-theoretic analysis of each. Section~\ref{sec:evaluation} presents compression performance and computational benchmarks. Section~\ref{sec:archaeological} discusses the archaeological recoverability properties of the format. Section~\ref{sec:conclusion} concludes with directions for future work.
+
+% ============================================================
+\section{Background}
+\label{sec:background}
+% ============================================================
+
+\subsection{Hangul Phonological Structure}
+
+Hangul (한글) was created in 1443 and promulgated in 1446 by King Sejong the
+Great of the Joseon Dynasty as a deliberately engineered writing system,
+designed to represent the sounds of Korean with a regular, learnable
+structure \cite{hunminjeongeum}. Unlike organically
+evolved scripts, Hangul encodes phonological features directly into its
+visual form \cite{sampson}: each written syllable block is a spatial composition
+of exactly two or three \emph{jamo} (자모), the atomic letter units of the script.
+
+Each syllable block is assembled from three positional components. The
+\emph{choseong} (초성), or onset, is the initial consonant; the
+\emph{jungseong} (중성), or nucleus, is the vowel; and the \emph{jongseong}
+(종성), or coda, is an optional final consonant. The inventories of each
+position are fixed: there are 19 distinct onsets, 21 distinct vowels, and 27
+distinct coda consonants, with the null coda (no final consonant) treated as
+a 28th coda symbol. The full space of legal syllable blocks is therefore
+$19 \times 21 \times 28 = 11{,}172$ distinct characters, all encoded
+contiguously in Unicode at code points U+AC00 through U+D7A3 \cite{nikl, unicodestd}.
+
+The Unicode decomposition of a syllable block at code point $c$ is given by \cite{unicodestd}:
+\begin{align}
+    \text{onset index}  &= \left\lfloor \frac{c - \texttt{0xAC00}}{21 \times 28} \right\rfloor \\
+    \text{vowel index}  &= \left\lfloor \frac{(c - \texttt{0xAC00}) \bmod (21 \times 28)}{28} \right\rfloor \\
+    \text{coda index}   &= (c - \texttt{0xAC00}) \bmod 28
+\end{align}
+This decomposition is the algebraic foundation of the \texttt{.sillok}
+encoding: rather than treating each of the 11,172 syllable blocks as an
+independent symbol, the encoder decomposes each syllable and codes the three
+components separately.
+
+The motivation for this decomposition is the highly non-uniform frequency
+distribution of jamo within each positional class. We derive position-specific
+frequencies from the training split of a 15.1-million-syllable Korean news
+corpus (Section~\ref{sec:evaluation}); the resulting distribution is broadly
+consistent with prior reports such as KREF \cite{kref}. In our corpus the
+vowel \emph{ㅏ} alone accounts for 19.96\% of all vowel occurrences, while the
+four rarest vowels (\emph{ㅒ}, \emph{ㅞ}, \emph{ㅙ}, and \emph{ㅟ}) together
+account for about 0.8\%. Similarly, the null coda accounts for 51.88\% of all
+coda positions, reflecting the large proportion of open syllables in Korean.
+This skew makes each positional class highly amenable to Huffman coding: a
+position-specific Huffman code assigns short codewords to the frequent symbols
+and longer codewords to the rare ones, whereas a flat encoding of the full
+11,172-symbol space wastes bits by treating all syllables as equally probable.
+
+Beyond individual syllables, Korean text is segmented into \emph{eojeol}
+(어절), spacing units that roughly correspond to morphological words.
+Eojeol exhibit a tight syllable-length distribution: in our news corpus
+approximately 88.9\% of eojeol contain between one and four syllables, with
+the three- and two-syllable eojeol being the most common and an average
+length of 2.96 syllables. This distribution motivates the word-length prefix
+mechanism described in Section~\ref{sec:optimizations}, which encodes the
+syllable count of each eojeol once at the start rather than marking word
+boundaries after every syllable.
+
+\subsection{Prior Work on Korean Text Compression}
+
+\paragraph{Character encodings.} Before the dominance of Unicode, Korean text
+was most commonly stored in legacy encodings such as EUC-KR and CP949,
+variable-width encodings that use a single byte for ASCII and two bytes for
+each precomposed Hangul syllable \cite{rfc1557}. UTF-8, now the
+de facto standard for Korean text on the web, trades this compactness for
+universality: every Hangul syllable in the U+AC00 to U+D7A3 range requires
+three bytes \cite{rfc3629, unicodehangul}. Neither encoding exploits the
+sub-character structure of Hangul. Both treat the syllable block as an atomic
+unit and allocate a fixed width to it regardless of how frequently its
+constituent jamo occur. The \texttt{.sillok} format departs from this
+tradition by encoding below the syllable level, at the granularity of
+individual jamo.
+
+\paragraph{General-purpose compression.} Algorithms such as gzip (DEFLATE) \cite{gzip},
+zstd \cite{zstd}, and Brotli \cite{brotli} achieve substantial size reductions on Korean text by
+exploiting statistical and dictionary-based redundancy at the byte level.
+These methods are highly effective and, for large documents, will typically
+outperform a static per-symbol code. However, they share two limitations
+relevant to our goals. First, they operate on raw byte sequences and have no
+model of Hangul's compositional structure, so they cannot exploit the
+position-specific jamo frequency skew directly; they must rediscover it
+indirectly through byte-level statistics. Second, and more important for
+archival use, their output is opaque: a compressed stream is not
+human-interpretable and is recoverable only with a faithful implementation
+of the decompression algorithm. This conflicts with the
+archaeological-recoverability goal that motivates \texttt{.sillok}
+(Section~\ref{sec:archaeological}).
+
+\paragraph{Korean-specific compression.} The most directly comparable prior
+work is PHDCM, the Parallel Hangul Dynamic Coding Method \cite{phdcm}, which
+models Korean text with a three-state transition graph reflecting the
+onset, vowel, and coda structure of Hangul syllables and reports roughly
+3.5 bits per character, with its principal contribution being an efficient
+parallel implementation evaluated on a 64-processor SIMD machine. PHDCM
+establishes the central insight that \texttt{.sillok} also builds on: that
+modeling the positional structure of Hangul yields better compression than
+treating syllables as atomic symbols. The two methods make different
+tradeoffs. PHDCM uses dynamic, adaptive coding that achieves a strong
+compression ratio but produces output whose codebook is determined at
+runtime; recovering the text requires replaying the exact adaptation
+procedure from the start of the stream, since no fixed codebook is stored.
+The \texttt{.sillok} format instead uses static Huffman tables derived from
+corpus frequency data, accepting a larger encoded size in exchange for a
+fixed, publishable codebook that can be reconstructed through frequency
+analysis. This choice directly serves the recoverability goal of
+Section~\ref{sec:archaeological}. The \texttt{.sillok} format also extends
+the model beyond pure Hangul with dedicated handling for word boundaries,
+numbers, ASCII runs, and document structure (Section~\ref{sec:optimizations}).
+
+\paragraph{Mixed-script text.} Contemporary Korean text routinely interleaves
+Hangul with Latin-script loanwords, brand names, and technical terms; corpus
+studies of lexical borrowing document the substantial and growing presence of
+such material in Korean writing \cite{loanwords}. A practical Korean encoding
+must therefore handle embedded ASCII gracefully rather than treating it as an
+error case. The \texttt{.sillok} format addresses this with an explicit
+ASCII-escape mechanism (Section~\ref{sec:optimizations}), allowing Latin text
+to be embedded inline without disrupting the jamo-level encoding of
+surrounding Hangul.
+
+% ============================================================
+\section{Format Specification}
+\label{sec:format}
+% ============================================================
+
+This section specifies the \texttt{.sillok} format: the byte-level file
+container, the four Huffman tables that drive the encoding, the decoding
+state machine, and the structural markers used to delimit documents. All
+values reported here are taken from the reference implementation, and have
+been verified to produce byte-identical bitstreams across the Python and C
+encoders and decoders on Hangul, numeric, and mixed-script text.
+
+\subsection{File Container}
+
+A \texttt{.sillok} file consists of a fixed 7-byte header followed by the
+encoded payload. The header has three fields:
+
+\begin{itemize}
+    \item \textbf{Magic number} (2 bytes): the ASCII bytes \texttt{SL}
+    (\texttt{0x53 0x4C}), identifying the file type.
+    \item \textbf{Version} (1 byte): the format version, currently
+    \texttt{0x01}.
+    \item \textbf{Bit count} (4 bytes): the length of the encoded bitstream
+    in bits, stored as a big-endian unsigned 32-bit integer.
+\end{itemize}
+
+The payload follows immediately and contains the Huffman-coded bitstream,
+padded with zero bits to the next byte boundary. The explicit bit count is
+necessary because the payload is not self-terminating: the final byte may
+contain padding bits that must be discarded, and the decoder uses the stored
+count to know exactly where the bitstream ends.
+
+\subsection{The Four Huffman Tables}
+
+Encoding is driven by four static, prefix-free Huffman tables, each built
+from corpus-derived frequency data. The tables are fixed at specification
+time and published as part of the format, so any conforming decoder
+reconstructs identical codes. The reference Python implementation rebuilds
+the codes from the frequency data at load time, while the C implementation
+hard-codes the same codes; we have verified that the two agree bit for bit.
+
+\textbf{Table 0 (dispatcher).} The top-level table contains 15 symbols that
+determine how the following bits are interpreted. It encodes word-length
+prefixes (\texttt{1-syl} through \texttt{6-syl} and an extended
+\texttt{7+-syl} escape), the two most common punctuation marks (comma and
+period), the middle dot (U+00B7), a \texttt{GLUE} marker that suppresses an
+automatically inserted space (Section~\ref{sec:optimizations}), and control
+symbols for numbers, ASCII runs, newlines, and section separators.
+Table~\ref{tab:t0} lists the dispatcher codes produced by the reference
+implementation.
+
+\begin{table}[H]
+\centering
+\caption{Table 0 (dispatcher) Huffman codes.}
+\label{tab:t0}
+\begin{tabular}{llr}
+\toprule
+Symbol & Code & Freq (\%) \\
+\midrule
+\texttt{3-syl}        & \texttt{01}         & 22.32 \\
+\texttt{2-syl}        & \texttt{00}         & 21.48 \\
+\texttt{4-syl}        & \texttt{101}        & 13.52 \\
+\texttt{GLUE}         & \texttt{1111}       & 10.04 \\
+\texttt{1-syl}        & \texttt{1110}       & 8.33 \\
+\texttt{NUMBER}       & \texttt{1100}       & 5.79 \\
+\texttt{ASCII\_START} & \texttt{1001}       & 5.14 \\
+\texttt{5-syl}        & \texttt{1000}       & 5.12 \\
+\texttt{.}            & \texttt{11011}      & 4.64 \\
+\texttt{6-syl}        & \texttt{110100}     & 1.73 \\
+\texttt{7+-syl}       & \texttt{1101011}    & 1.30 \\
+\texttt{·} (U+00B7)   & \texttt{11010101}   & 0.58 \\
+\texttt{NEWLINE}      & \texttt{110101000}  & 0.01 \\
+\texttt{,}            & \texttt{1101010011} & 0.01 \\
+\texttt{SECTION\_SEP} & \texttt{1101010010} & 0.01 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{GLUE} is a first-class dispatcher symbol, accounting for about 10\% of
+dispatch events on the news corpus; it suppresses the space the decoder would
+otherwise insert before a token continuing an eojeol
+(Section~\ref{sec:optimizations}). Frequencies are taken from the training
+split, with symbols absent or near-absent there (the standalone comma, the
+newline, and the section separator, all rare in single-paragraph articles)
+floored to a small nonzero value so that any Korean text remains encodable.
+
+\textbf{Tables 1--3 (jamo).} The remaining three tables encode the
+components of a Hangul syllable: Table 1 covers the 19 onsets, Table 2 the
+21 vowels, and Table 3 the 28 coda values (27 consonants plus the null
+coda). Because the null coda alone accounts for 51.88\% of coda positions,
+Table 3 assigns it the single-bit code \texttt{1}; the most frequent vowel
+\emph{ㅏ} (19.96\%) receives the 2-bit code \texttt{00}. The complete jamo
+tables are given in Appendix~\ref{app:tables}.
+
+Over the corpus frequencies, the combined jamo tables encode a Hangul
+syllable in an average of 9.46 bits, against a measured per-syllable entropy
+of 9.35 bits, for a coding efficiency of 98.8\%. Relative to UTF-8's fixed
+24 bits per syllable, this represents a 60.6\% reduction at the syllable
+level. End-to-end compression on running news text is lower, because numbers,
+embedded ASCII, and structural markers add overhead that is not amortised over
+syllables; we quantify this in Section~\ref{sec:evaluation}.
+
+\subsection{Decoding State Machine}
+
+Decoding proceeds as a finite state machine with four states, driven by the
+dispatcher table. The decoder begins in the \textsc{Word-Start} state.
+
+\begin{enumerate}
+    \item \textbf{\textsc{Word-Start}.} Read one symbol from Table 0. A
+    word-length symbol $n$ initialises a syllable counter to $n$ and
+    transitions to \textsc{Onset}. Control symbols are handled directly:
+    \texttt{NEWLINE} emits a line break, punctuation symbols emit their
+    character, \texttt{GLUE} suppresses the space before the next token,
+    \texttt{NUMBER} and \texttt{ASCII\_START} enter their respective
+    sub-modes, and \texttt{SECTION\_SEP} begins a section header.
+    \item \textbf{\textsc{Onset}.} Read one symbol from Table 1 (onset),
+    then transition to \textsc{Vowel}.
+    \item \textbf{\textsc{Vowel}.} Read one symbol from Table 2 (vowel),
+    then transition to \textsc{Coda}.
+    \item \textbf{\textsc{Coda}.} Read one symbol from Table 3 (coda) and
+    compose the completed syllable. Decrement the syllable counter. If the
+    counter is nonzero, return to \textsc{Onset} for the next syllable of
+    the same word; otherwise return to \textsc{Word-Start}.
+\end{enumerate}
+
+Spaces are not encoded directly. Instead the decoder inserts a single space
+before each content token (word, number, or ASCII run) by default, and a
+\texttt{GLUE} marker suppresses that space wherever the source had none, as
+between the pieces of the mixed token \emph{제1의}. Because consecutive Hangul
+words form separate tokens, the common case of space-separated eojeol incurs no
+\texttt{GLUE} markers at all. Newlines are preserved exactly. The format is
+therefore lossless up to a single normalisation: a run of intra-line whitespace
+is reproduced as one space. This mechanism is analysed in
+Section~\ref{sec:optimizations}.
+
+\subsection{Structural Markers}
+
+Two markers provide document structure above the level of individual words.
+
+\textbf{Day boundary.} A day boundary is encoded as 16 consecutive zero bits
+followed by a 21-bit date field: 12 bits of year, 4 bits of month, and 5
+bits of day, for 37 bits total. The marker is deliberately placed outside
+the Huffman system. During decoding it is tested only at dispatch points,
+that is, in the \textsc{Word-Start} state before a Table 0 symbol is read:
+the decoder inspects the next 16 bits, and if they are all zero, consumes the
+37-bit marker and emits the date; otherwise it proceeds to read a Table 0
+code. To prevent a 16-zero run occurring inside ordinary content from being
+mistaken for a boundary, the decoder validates the trailing date field,
+accepting the marker only when the month lies in 1--12 and the day in 1--31;
+the encoder, in turn, emits boundaries only at the start of a record. Across
+the full held-out test set (1.86 million syllables) this produced no false
+detections. The long zero run additionally serves as a visual landmark in a
+raw bit dump, although a naive scan of the \emph{entire} bitstream, rather than
+the decoder's dispatch points, can still encounter comparable zero runs inside
+numeric and ASCII payloads; we return to the recoverability implications in
+Section~\ref{sec:archaeological}.
+
+\textbf{Section separator.} Within a day's record, the \texttt{SECTION\_SEP}
+symbol from Table 0 introduces a thematic section. It is followed by the
+section name, encoded as ordinary Hangul words, and terminated by a
+\texttt{NEWLINE}. The reference daily-record format uses eight fixed
+sections (정치, 경제, 사회, 국제정세, 과학기술, 문화, 천재지변, 사신왈),
+mirroring the thematic organisation of the historical Joseon annals.
+
+% ============================================================
+\section{Optimization Techniques}
+\label{sec:optimizations}
+% ============================================================
+
+Beyond per-syllable jamo coding, \texttt{.sillok} applies three techniques that
+handle the non-Hangul aspects of real text: word boundaries, numbers, and
+embedded non-Hangul content. This section describes each and analyses its cost.
+All per-syllable figures are measured on the training corpus of
+Section~\ref{sec:evaluation} (15.1 million syllables across 5.1 million words,
+averaging 2.96 syllables per word).
+
+\subsection{Word-Length Prefix}
+
+Korean is written with spaces between \emph{eojeol}, so any encoding must record
+where each word ends. Three strategies are available:
+\begin{itemize}
+  \item \textbf{Explicit space:} emit a dedicated space symbol between words.
+  \item \textbf{Per-syllable boundary flag:} after each syllable, emit a bit
+  indicating whether the word continues.
+  \item \textbf{Word-length prefix} (\texttt{.sillok}): emit the word's syllable
+  count once, at its start; the decoder counts that many syllables and then
+  inserts a boundary.
+\end{itemize}
+
+We compare the three at the level of each mechanism's own optimal code. With an
+average word length of 2.96 syllables, a word boundary follows a fraction
+$p \approx 0.338$ of syllables. A per-syllable flag therefore encodes a
+Bernoulli($p$) event per syllable, whose entropy lower bound is
+\[
+  H(p) = -p\log_2 p - (1-p)\log_2(1-p) \approx 0.92
+\]
+bits per syllable, a bound that a naive one-bit flag (1.000 bits per syllable)
+does not reach. Encoding
+spaces as an explicit symbol in the boundary alphabet costs 1.09 bits/syllable,
+because the added symbol also lengthens the surrounding codes. The word-length
+prefix costs 0.85 bits/syllable (Table~\ref{tab:wb}).
+
+\begin{table}[H]
+\centering
+\caption{Per-syllable cost of word-boundary encoding strategies.}
+\label{tab:wb}
+\begin{tabular}{lr}
+\toprule
+Strategy & Bits/syllable \\
+\midrule
+Explicit space symbol            & 1.09 \\
+Naive one-bit flag               & 1.00 \\
+Entropy-optimal boundary flag    & 0.92 \\
+Word-length prefix (\texttt{.sillok}) & 0.85 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The word-length prefix thus matches the efficiency of an optimally-coded
+per-syllable boundary indicator and slightly betters it, because it encodes the
+full word-length distribution (Table~0 assigns the shortest codes to the most
+common two- and three-syllable words) rather than treating each syllable as an
+independent event, and it spends one symbol per word instead of one per
+syllable. These are mechanism-intrinsic costs under an optimal code; in the
+deployed format the word-length codes share Table 0 with the dispatch and
+control symbols, so they realise a somewhat higher per-syllable cost.
+
+\subsection{Lossless Spacing and the GLUE Marker}
+
+The word-length prefix reconstructs the boundary between consecutive Hangul
+words for free: in pure Hangul text every eojeol is a single word token, and the
+decoder inserts one space before each. Mixed tokens break this assumption. The
+eojeol \emph{제1의}, for instance, decomposes into a word (\emph{제}), a number
+(1), and a word (\emph{의}) with no spaces between them, yet the decoder would by
+default insert a space before each content piece.
+
+To remain lossless, \texttt{.sillok} emits a \texttt{GLUE} marker before any
+content piece that continues an eojeol, suppressing the default space. Because
+gluing occurs only inside mixed tokens, pure Hangul text incurs no \texttt{GLUE}
+markers. On our news corpus \texttt{GLUE} accounts for about 10\% of dispatch
+events (news is rich in numbers and Latin-script terms) and adds roughly 0.18
+bits/syllable. Combining the prefix and \texttt{GLUE}, the word-boundary
+mechanism costs about 1.03 bits/syllable while reproducing all inter-token
+spacing exactly, still below the 1.09 bits/syllable of an explicit space symbol.
+Spacing is preserved up to a single normalisation: a run of intra-line
+whitespace is reproduced as one space, and newlines are preserved exactly.
+
+\subsection{Number Encoding}
+
+A number is encoded as the \texttt{NUMBER} marker (5 bits), an 8-bit count of the
+following characters, and one 4-bit nibble per character. Digits 0--9 use their
+binary value; the decimal separators \emph{.} and \emph{,} use the
+otherwise-unused nibble values 10 and 11, so they survive the round trip. A
+$c$-character number therefore occupies $13 + 4c$ bits, against $8c$ bits in
+UTF-8. The format is more compact for numbers of four or more characters, which
+covers years, prices, and statistics; one- to three-character numbers carry a
+small fixed overhead. The 8-bit count admits up to 255 characters per number
+token, removing the silent overflow that a 4-bit count would suffer on long
+digit strings. Binary-coded decimal spends 4 bits per symbol against an entropy
+of $\log_2 12 \approx 3.58$ bits for the twelve-symbol alphabet, trading about
+0.4 bits per symbol for a fixed, trivially recoverable mapping.
+
+\subsection{Non-Hangul Escape}
+
+Characters that are neither Hangul, digits, nor the three dedicated punctuation
+marks are encoded through an escape: the \texttt{ASCII\_START} marker (6 bits),
+the characters' raw UTF-8 bytes (8 bits each), and a terminating null byte.
+Because UTF-8 never produces a zero byte for a non-null character, the null
+terminator is unambiguous. A run of $k$ bytes costs $14 + 8k$ bits, exactly 14
+bits more than the $8k$ bits the same bytes occupy in UTF-8. This mechanism is
+therefore not a compression technique but a means of embedding arbitrary
+non-Hangul content, such as the Latin-script loanwords and symbols common in
+contemporary Korean text (Section~\ref{sec:background}), without loss. Grouping
+consecutive non-Hangul characters into a single run amortises the fixed
+overhead, and the embedded bytes remain directly readable in a raw dump.
+
+% ============================================================
+\section{Evaluation}
+\label{sec:evaluation}
+% ============================================================
+
+\subsection{Corpus and Methodology}
+
+We evaluate on a corpus of contemporary Korean news articles \cite{navernews},
+using full article bodies rather than headlines. We adopt the corpus's own
+split: a training set of 22{,}194 articles (15.1 million Hangul syllables) and a
+held-out test set of 2{,}740 articles (1.86 million syllables). All four Huffman
+tables (Section~\ref{sec:format}) are derived \emph{solely} from the training
+split, and every figure below is measured on the held-out test set. The
+evaluation therefore reflects generalisation to unseen text rather than fit to
+the data used to build the tables. News is a deliberately demanding domain: it
+interleaves Hangul with frequent numbers, dates, percentages, and Latin-script
+terms, none of which the jamo coding can compress.
+
+\subsection{Compression Performance}
+
+Table~\ref{tab:comp} reports total encoded size on the held-out set.
+\texttt{.sillok} reduces the UTF-8 size by 56.4\%. This is below the 60.6\%
+achieved by the jamo tables on pure syllables (Section~\ref{sec:format}): the
+gap is the cost of non-Hangul content. Counting all numbers, ASCII, punctuation,
+and structural markers, the format spends 12.08 bits per Hangul syllable on
+running news, against the 9.46-bit jamo cost, because numbers and Latin terms
+consume bits while adding no syllables to the denominator.
+
+\begin{table}[H]
+\centering
+\caption{Size reduction relative to UTF-8 on the held-out test set, comparing
+\texttt{.sillok} against four general-purpose compressors in two regimes:
+each article compressed independently (per-record) and the whole corpus
+compressed as one stream.}
+\label{tab:comp}
+\begin{tabular}{lcc}
+\toprule
+ & \multicolumn{2}{c}{Reduction vs UTF-8} \\
+\cmidrule(l){2-3}
+Codec & Per-record & Whole corpus \\
+\midrule
+\texttt{.sillok}      & \textbf{56.4\%} & n/a \\
+gzip \cite{gzip}      & 52.6\% & 64.4\% \\
+zstd \cite{zstd}      & 52.9\% & 77.3\% \\
+Brotli \cite{brotli}  & 56.6\% & 77.2\% \\
+lzma                  & 49.1\% & 77.6\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:comp} compares \texttt{.sillok} against four general-purpose
+compressors in two regimes. On bulk text the modern compressors are far ahead,
+reaching roughly 77\%, because they exploit redundancy across documents that a
+static per-symbol code cannot. \texttt{.sillok} does not compete in this regime,
+and is not intended to: it targets independent daily records, not bulk archives.
+
+The per-record regime is the one that matches the format's purpose, and there
+the picture is different. \texttt{.sillok} reduces each record by 56.4\%, ahead
+of gzip (52.6\%), zstd (52.9\%), and lzma (49.1\%), and within a fraction of a
+point of Brotli (56.6\%), the strongest of the four. Brotli reaches this with a
+large built-in dictionary; \texttt{.sillok} matches it with a static model of
+fewer than a hundred symbols, derived from Korean phonology. The point is not a
+smaller file than every alternative, but compression comparable to the best of
+them from a transparent, fixed codebook that, unlike any of these compressors,
+is recoverable from the bitstream alone (Section~\ref{sec:archaeological}).
+
+\subsection{Computational Performance}
+
+We benchmark both implementations on a 100{,}000-character news excerpt
+(Table~\ref{tab:bench}). The C decoder processes 100{,}000 characters in
+3.74 ms and the encoder in 5.62 ms. The Python reference is 52$\times$ slower on
+decode and 15$\times$ slower on encode, reflecting its per-bit-string overhead.
+The two implementations produce byte-identical output, verified on held-out
+news text.
+
+\begin{table}[H]
+\centering
+\caption{Throughput on a 100{,}000-character news excerpt.}
+\label{tab:bench}
+\begin{tabular}{lrrr}
+\toprule
+ & C & Python & Speedup \\
+\midrule
+Encode (ms) & 5.62 & 84.0 & 15$\times$ \\
+Decode (ms) & 3.74 & 195.9 & 52$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Archaeological Recoverability}
+\label{sec:archaeological}
+% ============================================================
+
+The second design goal of \texttt{.sillok} (Section~\ref{sec:format}) is that
+the format remain readable by a future reader who possesses the raw bitstream
+but no software decoder and no specification. This property motivates the
+format's name: the \emph{Joseon Wangjo Sillok} survived for centuries and is
+still read today \cite{sillok}, whereas a file produced by an adaptive or
+dictionary-based compressor is intelligible only for as long as a faithful
+implementation of its algorithm survives. We do not claim that \texttt{.sillok}
+is self-describing. We argue, rather, that a reader equipped with knowledge of
+Korean phonology and elementary frequency analysis could reconstruct its
+contents, and we are explicit about where that argument breaks down.
+
+\subsection{Properties that support reconstruction}
+
+\textbf{A static, published codebook.} Unlike adaptive schemes such as PHDCM
+\cite{phdcm}, whose codebook changes as the stream is processed and exists only
+implicitly, \texttt{.sillok} uses fixed Huffman tables (Appendix~\ref{app:tables}).
+The same codeword always denotes the same symbol, so the stream can be treated
+as a substitution over a small alphabet and attacked with frequency analysis.
+
+\textbf{Linguistic structure.} Hangul's phonotactics are strongly constrained
+(Section~\ref{sec:background}): syllables are onset-vowel-coda triples, roughly
+half of all codas are null, and the marginal frequency of each position is
+stable across corpora. A reader who hypothesises that the stream encodes jamo in
+fixed positional order can match observed code frequencies against these known
+distributions: the shortest codes must be the high-frequency jamo (\emph{ㅇ},
+\emph{ㅏ}, the null coda) and the long rare codes the rare jamo. The 11,172
+syllables collapse onto 68 jamo, an alphabet small enough to solve by hand.
+
+\textbf{Scannable temporal landmarks.} The day-boundary marker
+(Section~\ref{sec:format}) is sixteen consecutive zero bits followed by a 21-bit
+date. The long zero run is conspicuous in any rendering of the raw bits, and the
+date fields increase monotonically through an archive. A reader who notices a
+recurring zero-run followed by a 21-bit field whose value increments from record
+to record has strong evidence that the field is a date or counter, without
+knowing the layout in advance. This monotonicity is the single most useful
+recovery cue the format provides.
+
+\subsection{A reconstruction sketch}
+
+A plausible reconstruction proceeds in stages. First, the reader scans for the
+conspicuous sixteen-zero runs and reads the 21-bit fields that follow; those
+that increase monotonically delimit the records and reveal the dating scheme,
+fixing the year, month, and day sub-fields by their ranges. Second, within a
+record, frequency analysis on the remaining prefix-free codes recovers the
+onset, vowel, and coda tables by alignment with known Korean jamo frequencies,
+and the fixed onset-vowel-coda cycle segments the stream into syllables, which
+the word-length prefixes group into words. Finally, numeric and embedded-Latin
+runs, stored as raw binary-coded decimal and UTF-8 bytes rather than Huffman
+codes, are directly legible once located. The raw representation that makes
+these runs incompressible (Section~\ref{sec:optimizations}) also makes them the
+easiest part of the stream to recover.
+
+\subsection{Limitations}
+
+Recoverability is a matter of degree, not a guarantee, and three caveats bound
+it. First, the day-boundary scan is not collision-free: a sixteen-zero run can
+occur inside numeric or ASCII payloads (Section~\ref{sec:format}), and although
+the decoder rejects such matches by validating the date fields, validation alone
+is weak, since a randomly placed 21-bit field has roughly a three-in-four chance
+of presenting a plausible month and day. The reliable disambiguator is again
+monotonicity: spurious matches do not form an increasing sequence at regular
+intervals, whereas genuine boundaries do. Second, reconstruction presupposes
+that the reader knows the text is Korean and understands Hangul's compositional
+structure; the format encodes no metadata announcing this. Third, the procedure
+we sketch is a human one. The format is recoverable in the sense that the
+Rosetta Stone was decipherable, through knowledge, frequency analysis, and
+structural regularity, not in the sense that a generic tool can decode it
+unaided. We regard this as an honest reading of the goal rather than a
+weakening of it: the durability of meaning, as the Joseon annals demonstrate,
+has historically rested on exactly these properties.
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ============================================================
+
+We have presented \texttt{.sillok}, a lossless text encoding format that
+exploits the compositional regularity of Hangul. By decomposing each syllable
+into onset, vowel, and coda and coding each position with a static,
+corpus-derived Huffman table, the format encodes Korean syllables in 9.46 bits
+on average, a 60.6\% reduction relative to UTF-8 at the syllable level. A
+word-length prefix reconstructs word boundaries without storing spaces, a
+\texttt{GLUE} marker preserves spacing inside mixed-script tokens, and dedicated
+representations handle numbers, embedded non-Hangul text, and document
+structure. We provide byte-identical Python and C implementations and a
+day-boundary marker designed to serve as a scannable temporal landmark for
+long-term archival.
+
+Evaluated on a held-out test set of Korean news, with the frequency tables
+trained on a disjoint split, \texttt{.sillok} reduces size by 56.4\% relative to
+UTF-8. It is not a general-purpose compressor: compressed as a bulk corpus,
+modern methods such as zstd and Brotli are far ahead. On the independent daily
+records for which the format is intended, however, \texttt{.sillok} is
+competitive with the best of them, matching Brotli and beating gzip, zstd, and
+lzma, while being the only one of the five reconstructible from the bitstream
+alone. Its contribution is therefore not a new high-water mark in ratio but a
+format that pairs competitive per-record compression with linguistic
+transparency and archaeological recoverability.
+
+Several directions remain. The day-boundary marker relies on date validation and
+the monotonicity of dates to resolve the zero-run collisions noted in
+Section~\ref{sec:archaeological}; a marker provably free of such collisions, for
+example a reserved synchronisation pattern or a bit-stuffing rule, would make
+automated recovery as reliable as the human recovery we describe. The static
+tables are tuned to the news domain, and other registers, such as literary or
+conversational Korean, would merit their own measured frequencies or a light,
+recoverability-preserving adaptivity. Finally, the static order-0 jamo model
+leaves redundancy unexploited: prior adaptive methods reach roughly 3.5 bits per
+character \cite{phdcm}, and a context model that preserves the format's static,
+recoverable codebook is an open and appealing problem. To keep the format fully
+specified by this paper, the complete frequency tables (Appendix~\ref{app:tables})
+and a worked encoding example (Appendix~\ref{app:example}) are included, so that
+an independent reader can both reimplement the codec and exercise the
+recoverability argument of Section~\ref{sec:archaeological}.
+
+% ============================================================
+\begin{thebibliography}{9}
+
+\bibitem{kref}
+KREF Korean Frequency Analysis.
+\url{http://www.kref.altervista.org/kreffrequency.html}.
+Corpus of 17,691 Korean syllables with jamo-level frequency data.
+
+\bibitem{navernews}
+D. Kim.
+\emph{Naver News Summarization (Korean)}. Hugging Face dataset, 2022.
+Apache-2.0 licence; full Korean news article bodies, 22{,}194 training and
+2{,}740 test documents.
+\url{https://huggingface.co/datasets/daekeun-ml/naver-news-summarization-ko}.
+
+\bibitem{phdcm}
+Min, Yong-Sik (1995).
+PHDCM: Efficient Compression of Hangul Text in Parallel.
+\emph{The Journal of the Acoustical Society of Korea}, 14(2E), 50--56.
+Parallel Hangul Dynamic Coding Method using a three-state transition graph;
+reports approximately 3.5 bits per character.
+
+\bibitem{rfc1557}
+U. Choi, K. Chon, and H. Park (1993).
+\emph{RFC 1557: Korean Character Encoding for Internet Messages}.
+Internet Engineering Task Force.
+EUC-KR encoding using KS C 5601 (KS X 1001); two bytes per Hangul syllable.
+\url{https://www.rfc-editor.org/rfc/rfc1557}.
+
+\bibitem{rfc3629}
+F. Yergeau (2003).
+\emph{RFC 3629: UTF-8, a transformation format of ISO 10646}.
+Internet Engineering Task Force.
+Characters in U+0800--U+FFFF, including all Hangul syllables, encode as three bytes.
+\url{https://www.rfc-editor.org/rfc/rfc3629}.
+
+\bibitem{unicodehangul}
+The Unicode Consortium.
+\emph{Hangul Syllables}, Unicode code chart, range U+AC00--U+D7A3.
+\url{https://www.unicode.org/charts/PDF/UAC00.pdf}.
+
+\bibitem{unicodestd}
+The Unicode Consortium.
+\emph{The Unicode Standard, Version 16.0.0}, Section 3.12: Conjoining Jamo Behavior.
+South San Francisco: The Unicode Consortium, 2024. ISBN 978-1-936213-34-4.
+\url{https://www.unicode.org/versions/Unicode16.0.0/core-spec/chapter-3/}.
+
+\bibitem{sampson}
+Sampson, G. (1985).
+\emph{Writing Systems: A Linguistic Introduction}.
+Stanford University Press.
+Introduces the term ``featural'' to characterise Hangul.
+
+\bibitem{nikl}
+National Institute of Korean Language (국립국어원).
+Official regulator of the Korean language; reference on Hangul orthography and syllable structure.
+\url{https://www.korean.go.kr/front_eng/}.
+
+\bibitem{hunminjeongeum}
+UNESCO Memory of the World Register.
+\emph{Hunminjeongum Manuscript}. Inscribed 1997.
+King Sejong completed the Korean alphabet in 1443 and promulgated it in 1446.
+\url{https://www.unesco.org/en/memory-world/hunminjeongum-manuscript}.
+
+\bibitem{gzip}
+P. Deutsch (1996).
+\emph{RFC 1952: GZIP File Format Specification version 4.3}.
+Internet Engineering Task Force.
+\url{https://www.rfc-editor.org/rfc/rfc1952}.
+
+\bibitem{zstd}
+Y. Collet and M. Kucherawy, Eds. (2021).
+\emph{RFC 8878: Zstandard Compression and the application/zstd Media Type}.
+Internet Engineering Task Force.
+\url{https://www.rfc-editor.org/rfc/rfc8878}.
+
+\bibitem{brotli}
+J. Alakuijala and Z. Szabadka (2016).
+\emph{RFC 7932: Brotli Compressed Data Format}.
+Internet Engineering Task Force.
+\url{https://www.rfc-editor.org/rfc/rfc7932}.
+
+\bibitem{sillok}
+National Institute of Korean History.
+\emph{Joseon Wangjo Sillok} (조선왕조실록), English introduction.
+1,893 volumes, 49,646,667 characters, covering 472 years (1392--1863).
+UNESCO Memory of the World, registered 1997.
+\url{https://sillok.history.go.kr/intro/english.do}.
+
+\bibitem{loanwords}
+Y. Oh and H. Son (2024).
+Lexical borrowing in Korean: a diachronic approach based on a corpus analysis.
+\emph{Corpus Linguistics and Linguistic Theory}, 20(2), 407--431.
+\url{https://doi.org/10.1515/cllt-2022-0102}.
+
+\bibitem{huffman}
+Huffman, D.A. (1952).
+A method for the construction of minimum-redundancy codes.
+\emph{Proceedings of the IRE}, 40(9), 1098--1101.
+
+\end{thebibliography}
+
+% ============================================================
+\appendix
+\section{Jamo Huffman Tables}
+\label{app:tables}
+% ============================================================
+
+The complete onset, vowel, and coda tables (Tables 1--3 of
+Section~\ref{sec:format}), derived from the training split of the news corpus
+(Section~\ref{sec:evaluation}). Frequencies are percentages within each
+positional class; codes are the prefix-free Huffman codewords. Symbols absent
+from the training data are floored to 0.01\% so that all 11,172 syllables remain
+encodable.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Table 1: onset (\emph{choseong}) codes.}
+\begin{tabular}{lrl}
+\toprule
+Onset & Freq (\%) & Code \\
+\midrule
+\texttt{ㅇ} & 21.6 & \texttt{01} \\
+\texttt{ㄱ} & 12.57 & \texttt{101} \\
+\texttt{ㅅ} & 9.97 & \texttt{001} \\
+\texttt{ㅈ} & 9.74 & \texttt{000} \\
+\texttt{ㄷ} & 8.57 & \texttt{1110} \\
+\texttt{ㅎ} & 8.24 & \texttt{1101} \\
+\texttt{ㄹ} & 6.51 & \texttt{1001} \\
+\texttt{ㄴ} & 4.77 & \texttt{11111} \\
+\texttt{ㅂ} & 4.73 & \texttt{11110} \\
+\texttt{ㅁ} & 4.04 & \texttt{11000} \\
+\texttt{ㅊ} & 2.88 & \texttt{10001} \\
+\texttt{ㅌ} & 2.32 & \texttt{10000} \\
+\texttt{ㅍ} & 1.97 & \texttt{110010} \\
+\texttt{ㅋ} & 1.11 & \texttt{1100111} \\
+\texttt{ㄸ} & 0.38 & \texttt{11001100} \\
+\texttt{ㄲ} & 0.34 & \texttt{110011011} \\
+\texttt{ㅆ} & 0.12 & \texttt{1100110100} \\
+\texttt{ㅃ} & 0.07 & \texttt{11001101010} \\
+\texttt{ㅉ} & 0.07 & \texttt{11001101011} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Table 2: vowel (\emph{jungseong}) codes.}
+\begin{tabular}{lrl}
+\toprule
+Vowel & Freq (\%) & Code \\
+\midrule
+\texttt{ㅏ} & 19.96 & \texttt{00} \\
+\texttt{ㅣ} & 15.01 & \texttt{110} \\
+\texttt{ㅡ} & 12.0 & \texttt{100} \\
+\texttt{ㅗ} & 9.98 & \texttt{010} \\
+\texttt{ㅓ} & 9.27 & \texttt{1110} \\
+\texttt{ㅜ} & 7.29 & \texttt{1011} \\
+\texttt{ㅐ} & 5.9 & \texttt{0111} \\
+\texttt{ㅕ} & 4.95 & \texttt{0110} \\
+\texttt{ㅔ} & 4.8 & \texttt{11111} \\
+\texttt{ㅘ} & 2.29 & \texttt{111100} \\
+\texttt{ㅚ} & 1.37 & \texttt{101001} \\
+\texttt{ㅝ} & 1.28 & \texttt{101000} \\
+\texttt{ㅢ} & 1.24 & \texttt{1111011} \\
+\texttt{ㅛ} & 1.21 & \texttt{1111010} \\
+\texttt{ㅠ} & 1.18 & \texttt{1010111} \\
+\texttt{ㅑ} & 0.76 & \texttt{1010101} \\
+\texttt{ㅖ} & 0.69 & \texttt{1010100} \\
+\texttt{ㅟ} & 0.59 & \texttt{10101101} \\
+\texttt{ㅙ} & 0.16 & \texttt{101011001} \\
+\texttt{ㅞ} & 0.05 & \texttt{1010110001} \\
+\texttt{ㅒ} & 0.01 & \texttt{1010110000} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Table 3: coda (\emph{jongseong}) codes; \texttt{(none)} is the null coda.}
+\begin{tabular}{lrl}
+\toprule
+Coda & Freq (\%) & Code \\
+\midrule
+\texttt{(none)} & 51.88 & \texttt{1} \\
+\texttt{ㄴ} & 15.68 & \texttt{011} \\
+\texttt{ㅇ} & 9.77 & \texttt{001} \\
+\texttt{ㄹ} & 8.72 & \texttt{0101} \\
+\texttt{ㄱ} & 5.2 & \texttt{0100} \\
+\texttt{ㅁ} & 2.79 & \texttt{00011} \\
+\texttt{ㅂ} & 2.13 & \texttt{00010} \\
+\texttt{ㅆ} & 1.99 & \texttt{00001} \\
+\texttt{ㅅ} & 0.7 & \texttt{0000011} \\
+\texttt{ㅍ} & 0.17 & \texttt{00000001} \\
+\texttt{ㄶ} & 0.15 & \texttt{00000000} \\
+\texttt{ㄷ} & 0.13 & \texttt{000001011} \\
+\texttt{ㅈ} & 0.13 & \texttt{000001010} \\
+\texttt{ㄺ} & 0.11 & \texttt{000000111} \\
+\texttt{ㅊ} & 0.11 & \texttt{000001000} \\
+\texttt{ㅄ} & 0.1 & \texttt{000000101} \\
+\texttt{ㅌ} & 0.1 & \texttt{000000110} \\
+\texttt{ㅎ} & 0.07 & \texttt{0000010011} \\
+\texttt{ㄲ} & 0.03 & \texttt{00000100101} \\
+9 rarer codas & $\le$0.01 & 9--12 bits \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{A Worked Encoding}
+\label{app:example}
+% ============================================================
+
+To make the format concrete and self-contained, we trace the encoding of the
+string \texttt{한국 2026} (``Korea 2026''), which exercises the word-length
+prefix, jamo decomposition, and number encoding. The tokeniser produces one word
+and one number; the space between them is not stored, but reinserted by the
+decoder. Using the tables of Appendix~\ref{app:tables} and Table~\ref{tab:t0},
+the encoding reads as in Table~\ref{tab:example}.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\caption{Encoding of \texttt{한국 2026} into 50 bits, read left to right.}
+\label{tab:example}
+\begin{tabular}{lll}
+\toprule
+Bits & Source & Meaning \\
+\midrule
+\texttt{00}                 & Table 0 & word of two syllables \\
+\texttt{1101\,00\,011}      & Tables 1--3 & 한 $=$ ㅎ $+$ ㅏ $+$ ㄴ \\
+\texttt{101\,1011\,0100}    & Tables 1--3 & 국 $=$ ㄱ $+$ ㅜ $+$ ㄱ \\
+\texttt{1100}               & Table 0 & \texttt{NUMBER} marker \\
+\texttt{00000100}           & raw & character count $= 4$ \\
+\texttt{0010\,0000\,0010\,0110} & raw & digits 2, 0, 2, 6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The complete bitstream is the 50-bit concatenation
+\texttt{\seqsplit{00110100011101101101001100000001000010000000100110}}.
+Against UTF-8's 88 bits (11 bytes) for the same string, \texttt{.sillok} uses 50
+bits; with the 7-byte header, a standalone file is 14 bytes. A decoder beginning
+in the \textsc{Word-Start} state reads \texttt{00} as a two-syllable word,
+decodes two onset-vowel-coda triples into 한 and 국, then reads \texttt{1100} as
+the \texttt{NUMBER} marker followed by a 4-character count and four
+binary-coded-decimal digits, reinserting one space before the number.
+
+\end{document}
