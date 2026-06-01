@@ -40,7 +40,6 @@ src/rss_scraper.py   Korean news RSS scraper
 src/daily_sillok.py  daily scrape -> encode -> archive pipeline
 c/sillok.c           fast C implementation (byte-identical to Python)
 paper/               LaTeX source of the paper
-archive/             daily .sillok records (produced by the workflow)
 ```
 
 ## Usage
@@ -56,11 +55,15 @@ print(decode_bitstream(read_sillok("record.sillok")))
 The C build: `gcc -O2 -o sillok_c c/sillok.c`, then
 `./sillok_c encode in.txt out.sillok` / `./sillok_c decode out.sillok`.
 
-## Daily archive
+## A daily record (kept private)
 
-A GitHub Actions workflow scrapes Korean news each day, builds a sectioned
-digest, encodes it to `.sillok`, and commits it to `archive/`. See
-[`.github/workflows/daily_sillok.yml`](.github/workflows/daily_sillok.yml).
+`src/daily_sillok.py` scrapes Korean news, builds a sectioned daily digest, and
+encodes it to a single `.sillok` record — a small, modern echo of the daily
+annals the format is named after. I run this for myself each day, but I keep the
+resulting archive **private**: the records contain third-party news content, so I
+do not republish them here, out of respect for the outlets' copyright and terms
+of use. The pipeline is included so the capability is fully reproducible on your
+own text. Questions about it are welcome by email (`jewoosuh0111 [at] gmail.com`).
 
 ## Licence
 
