@@ -77,6 +77,8 @@ own text. Questions about it are welcome by email (`jewoosuh0111 [at] gmail.com`
   author = {Suh, Jewoo},
   title  = {{.sillok}: A Korean-Specific Lossless Text Encoding Format},
   year   = {2026},
+  month  = {6},
+  note   = {Version 1.0},
   howpublished = {\url{https://github.com/jewoo-suh/modern-sillok}}
 }
 ```
